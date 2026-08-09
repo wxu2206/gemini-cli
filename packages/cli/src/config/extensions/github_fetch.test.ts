@@ -110,6 +110,7 @@ describe('fetchJson', () => {
     getMock.mockImplementationOnce((_url, _options, callback) => {
       const res = new EventEmitter() as IncomingMessage;
       res.statusCode = 404;
+      res.resume = vi.fn();
       (callback as (res: IncomingMessage) => void)(res);
       res.emit('end');
       return new EventEmitter() as ClientRequest;
@@ -124,12 +125,71 @@ describe('fetchJson', () => {
     const error = new Error('Network error');
     getMock.mockImplementationOnce(() => {
       const req = new EventEmitter() as ClientRequest;
-      req.emit('error', error);
+      queueMicrotask(() => req.emit('error', error));
       return req;
     });
 
     await expect(fetchJson('https://example.com/error')).rejects.toThrow(
       'Network error',
+    );
+  });
+
+  it('should reject malformed JSON through the Promise', async () => {
+    getMock.mockImplementationOnce((_url, _options, callback) => {
+      const res = new EventEmitter() as IncomingMessage;
+      res.statusCode = 200;
+      (callback as (res: IncomingMessage) => void)(res);
+      res.emit('data', Buffer.from('{"foo": invalid}'));
+      res.emit('end');
+      return new EventEmitter() as ClientRequest;
+    });
+
+    await expect(fetchJson('https://api.github.com/malformed')).rejects.toThrow(
+      'Failed to parse JSON response from https://api.github.com/malformed',
+    );
+  });
+
+  it('should reject truncated JSON through the Promise', async () => {
+    getMock.mockImplementationOnce((_url, _options, callback) => {
+      const res = new EventEmitter() as IncomingMessage;
+      res.statusCode = 200;
+      (callback as (res: IncomingMessage) => void)(res);
+      res.emit('data', Buffer.from('{"foo": "bar"'));
+      res.emit('end');
+      return new EventEmitter() as ClientRequest;
+    });
+
+    await expect(fetchJson('https://api.github.com/truncated')).rejects.toThrow(
+      'Failed to parse JSON response from https://api.github.com/truncated',
+    );
+  });
+
+  it('should reject on response error', async () => {
+    const error = new Error('Response failed');
+    getMock.mockImplementationOnce((_url, _options, callback) => {
+      const res = new EventEmitter() as IncomingMessage;
+      res.statusCode = 200;
+      (callback as (res: IncomingMessage) => void)(res);
+      queueMicrotask(() => res.emit('error', error));
+      return new EventEmitter() as ClientRequest;
+    });
+
+    await expect(
+      fetchJson('https://api.github.com/response-error'),
+    ).rejects.toThrow('Response failed');
+  });
+
+  it('should reject when the response is aborted', async () => {
+    getMock.mockImplementationOnce((_url, _options, callback) => {
+      const res = new EventEmitter() as IncomingMessage;
+      res.statusCode = 200;
+      (callback as (res: IncomingMessage) => void)(res);
+      res.emit('aborted');
+      return new EventEmitter() as ClientRequest;
+    });
+
+    await expect(fetchJson('https://api.github.com/aborted')).rejects.toThrow(
+      'Response aborted while fetching https://api.github.com/aborted',
     );
   });
 
