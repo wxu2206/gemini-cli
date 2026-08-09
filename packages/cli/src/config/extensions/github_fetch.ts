@@ -22,37 +22,85 @@ export async function fetchJson<T>(
     headers.Authorization = `token ${token}`;
   }
   return new Promise((resolve, reject) => {
-    https
-      .get(url, { headers }, (res) => {
-        if (res.statusCode === 302 || res.statusCode === 301) {
-          if (redirectCount >= 10) {
-            return reject(new Error('Too many redirects'));
-          }
-          if (!res.headers.location) {
-            return reject(new Error('No location header in redirect response'));
-          }
-          res.resume();
-          fetchJson<T>(
-            new URL(res.headers.location, url).toString(),
-            redirectCount + 1,
-          )
-            .then(resolve)
-            .catch(reject);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          return reject(
-            new Error(`Request failed with status code ${res.statusCode}`),
+    let settled = false;
+    const resolveOnce = (value: T) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+    const rejectOnce = (error: Error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    };
+
+    const request = https.get(url, { headers }, (res) => {
+      let ended = false;
+      const rejectResponse = (error: Error) => rejectOnce(error);
+      res.once('error', rejectResponse);
+      res.once('aborted', () => {
+        rejectResponse(new Error(`Response aborted while fetching ${url}`));
+      });
+      res.once('close', () => {
+        if (!ended && res.complete === false) {
+          rejectResponse(
+            new Error(`Response incomplete while fetching ${url}`),
           );
         }
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const data = Buffer.concat(chunks).toString();
+      });
+
+      if (res.statusCode === 302 || res.statusCode === 301) {
+        if (redirectCount >= 10) {
+          res.resume();
+          return rejectOnce(new Error('Too many redirects'));
+        }
+        if (!res.headers.location) {
+          res.resume();
+          return rejectOnce(
+            new Error('No location header in redirect response'),
+          );
+        }
+        res.resume();
+        fetchJson<T>(
+          new URL(res.headers.location, url).toString(),
+          redirectCount + 1,
+        )
+          .then(resolveOnce)
+          .catch(rejectOnce);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return rejectOnce(
+          new Error(`Request failed with status code ${res.statusCode}`),
+        );
+      }
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        ended = true;
+        if (res.complete === false) {
+          rejectResponse(
+            new Error(`Response incomplete while fetching ${url}`),
+          );
+          return;
+        }
+        const data = Buffer.concat(chunks).toString();
+        try {
           // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-          resolve(JSON.parse(data) as T);
-        });
-      })
-      .on('error', reject);
+          resolveOnce(JSON.parse(data) as T);
+        } catch (error) {
+          rejectResponse(
+            new Error(
+              `Failed to parse JSON response from ${url}: ${error instanceof Error ? error.message : String(error)}`,
+              { cause: error },
+            ),
+          );
+        }
+      });
+    });
+    request.once('error', rejectOnce);
   });
 }
