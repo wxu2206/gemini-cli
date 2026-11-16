@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   cloneFromGit,
   tryParseGithubUrl,
@@ -54,7 +54,10 @@ vi.mock('node:fs');
 vi.mock('node:https');
 vi.mock('tar');
 vi.mock('extract-zip');
-vi.mock('./github_fetch.js');
+vi.mock('./github_fetch.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./github_fetch.js')>();
+  return { ...actual, fetchJson: vi.fn() };
+});
 vi.mock('../extension-manager.js');
 // Mock settings.ts to avoid top-level side effects if possible, or just rely on Storage mock
 vi.mock('../settings.js', () => ({
@@ -328,7 +331,12 @@ describe('github.ts', () => {
     it('should use correct headers for release assets', async () => {
       vi.mocked(fetchJson).mockResolvedValue({
         tag_name: 'v1.0.0',
-        assets: [{ name: 'asset.tar.gz', url: 'http://asset.url' }],
+        assets: [
+          {
+            name: 'asset.tar.gz',
+            url: 'https://api.github.com/repos/owner/repo/releases/assets/123',
+          },
+        ],
       });
       vi.mocked(os.platform).mockReturnValue('linux');
       vi.mocked(os.arch).mockReturnValue('x64');
@@ -378,7 +386,7 @@ describe('github.ts', () => {
       await promise;
 
       expect(https.get).toHaveBeenCalledWith(
-        'http://asset.url',
+        'https://api.github.com/repos/owner/repo/releases/assets/123',
         expect.objectContaining({
           headers: expect.objectContaining({
             Accept: 'application/octet-stream',
@@ -392,7 +400,7 @@ describe('github.ts', () => {
       vi.mocked(fetchJson).mockResolvedValue({
         tag_name: 'v1.0.0',
         assets: [],
-        tarball_url: 'http://tarball.url',
+        tarball_url: 'https://api.github.com/repos/owner/repo/tarball/v1.0.0',
       });
 
       // Mock https.get and fs.createWriteStream for downloadFile
@@ -440,7 +448,7 @@ describe('github.ts', () => {
       await promise;
 
       expect(https.get).toHaveBeenCalledWith(
-        'http://tarball.url',
+        'https://api.github.com/repos/owner/repo/tarball/v1.0.0',
         expect.objectContaining({
           headers: expect.objectContaining({
             Accept: 'application/vnd.github+json',
@@ -470,6 +478,52 @@ describe('github.ts', () => {
   });
 
   describe('downloadFile', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('does not send a GitHub token or supplied authorization to a cross-origin redirect', async () => {
+      vi.stubEnv('GITHUB_TOKEN', 'fixture-token');
+      const redirect =
+        new EventEmitter() as import('node:http').IncomingMessage;
+      Object.assign(redirect, {
+        statusCode: 302,
+        headers: { location: 'https://audit.invalid/asset' },
+        resume: vi.fn(),
+      });
+      const success = new EventEmitter() as import('node:http').IncomingMessage;
+      Object.assign(success, { statusCode: 200, pipe: vi.fn() });
+      vi.mocked(https.get)
+        .mockImplementationOnce((_url, options, cb) => {
+          expect(options).toMatchObject({
+            headers: { Authorization: 'token fixture-token' },
+          });
+          cb?.(redirect);
+          return new EventEmitter() as import('node:http').ClientRequest;
+        })
+        .mockImplementationOnce((_url, options, cb) => {
+          const headers = (options as { headers: Record<string, string> })
+            .headers;
+          expect(
+            Object.keys(headers).some((key) => /authorization/i.test(key)),
+          ).toBe(false);
+          cb?.(success);
+          return new EventEmitter() as import('node:http').ClientRequest;
+        });
+      const stream = new EventEmitter() as fs.WriteStream;
+      Object.assign(stream, { close: vi.fn((cb) => cb?.()) });
+      vi.mocked(fs.createWriteStream).mockReturnValue(stream);
+      const promise = downloadFile(
+        'https://api.github.com/fixture',
+        '/fixture',
+        {
+          headers: { authorization: 'fixture-supplied' },
+        },
+      );
+      await vi.waitFor(() => expect(fs.createWriteStream).toHaveBeenCalled());
+      stream.emit('finish');
+      await expect(promise).resolves.toBeUndefined();
+      expect(https.get).toHaveBeenCalledTimes(2);
+    });
+
     it('should download file successfully', async () => {
       const mockReq = new EventEmitter();
       const mockRes =
@@ -488,7 +542,7 @@ describe('github.ts', () => {
       Object.assign(mockStream, { close: vi.fn((cb) => cb && cb()) });
       vi.mocked(fs.createWriteStream).mockReturnValue(mockStream);
 
-      const promise = downloadFile('url', '/dest');
+      const promise = downloadFile('https://example.com/asset', '/dest');
       mockRes.emit('end');
       mockStream.emit('finish');
 
@@ -509,9 +563,9 @@ describe('github.ts', () => {
         return mockReq as unknown as import('node:http').ClientRequest;
       });
 
-      await expect(downloadFile('url', '/dest')).rejects.toThrow(
-        'Request failed with status code 404',
-      );
+      await expect(
+        downloadFile('https://example.com/asset', '/dest'),
+      ).rejects.toThrow('Request failed with status code 404');
     });
 
     it('should follow redirects', async () => {
@@ -521,6 +575,7 @@ describe('github.ts', () => {
       Object.assign(mockResRedirect, {
         statusCode: 302,
         headers: { location: 'new-url' },
+        resume: vi.fn(),
       });
 
       const mockResSuccess =
@@ -543,14 +598,15 @@ describe('github.ts', () => {
       Object.assign(mockStream, { close: vi.fn((cb) => cb && cb()) });
       vi.mocked(fs.createWriteStream).mockReturnValue(mockStream);
 
-      const promise = downloadFile('url', '/dest');
+      const promise = downloadFile('https://example.com/asset', '/dest');
+      await vi.waitFor(() => expect(fs.createWriteStream).toHaveBeenCalled());
       mockResSuccess.emit('end');
       mockStream.emit('finish');
 
       await expect(promise).resolves.toBeUndefined();
       expect(https.get).toHaveBeenCalledTimes(2);
       expect(https.get).toHaveBeenLastCalledWith(
-        'new-url',
+        'https://example.com/new-url',
         expect.anything(),
         expect.anything(),
       );
@@ -563,6 +619,7 @@ describe('github.ts', () => {
       Object.assign(mockResRedirect, {
         statusCode: 302,
         headers: { location: 'new-url' },
+        resume: vi.fn(),
       });
 
       vi.mocked(https.get).mockImplementation((url, options, cb) => {
@@ -571,9 +628,9 @@ describe('github.ts', () => {
         return mockReq as unknown as import('node:http').ClientRequest;
       });
 
-      await expect(downloadFile('url', '/dest')).rejects.toThrow(
-        'Too many redirects',
-      );
+      await expect(
+        downloadFile('https://example.com/asset', '/dest'),
+      ).rejects.toThrow('Too many redirects');
     }, 10000); // Increase timeout for this test if needed, though with mocks it should be fast
 
     it('should fail if redirect location is missing', async () => {
@@ -582,6 +639,7 @@ describe('github.ts', () => {
         new EventEmitter() as unknown as import('node:http').IncomingMessage;
       Object.assign(mockResRedirect, {
         statusCode: 302,
+        resume: vi.fn(),
         headers: {}, // No location
       });
 
@@ -591,9 +649,9 @@ describe('github.ts', () => {
         return mockReq as unknown as import('node:http').ClientRequest;
       });
 
-      await expect(downloadFile('url', '/dest')).rejects.toThrow(
-        'Redirect response missing Location header',
-      );
+      await expect(
+        downloadFile('https://example.com/asset', '/dest'),
+      ).rejects.toThrow('Redirect response missing Location header');
     });
 
     it('should pass custom headers', async () => {
@@ -612,7 +670,7 @@ describe('github.ts', () => {
       Object.assign(mockStream, { close: vi.fn((cb) => cb && cb()) });
       vi.mocked(fs.createWriteStream).mockReturnValue(mockStream);
 
-      const promise = downloadFile('url', '/dest', {
+      const promise = downloadFile('https://example.com/asset', '/dest', {
         headers: { 'X-Custom': 'value' },
       });
       mockRes.emit('end');
@@ -620,7 +678,7 @@ describe('github.ts', () => {
 
       await expect(promise).resolves.toBeUndefined();
       expect(https.get).toHaveBeenCalledWith(
-        'url',
+        'https://example.com/asset',
         expect.objectContaining({
           headers: expect.objectContaining({ 'X-Custom': 'value' }),
         }),

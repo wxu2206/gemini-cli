@@ -18,7 +18,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as tar from 'tar';
 import extract from 'extract-zip';
-import { fetchJson, getGitHubToken } from './github_fetch.js';
+import {
+  fetchJson,
+  getGitHubToken,
+  githubRequestHeaders,
+} from './github_fetch.js';
 import type { ExtensionConfig } from '../extension.js';
 import type { ExtensionManager } from '../extension-manager.js';
 import { EXTENSIONS_CONFIG_FILENAME } from './variables.js';
@@ -520,30 +524,35 @@ export async function downloadFile(
   options?: DownloadOptions,
   redirectCount: number = 0,
 ): Promise<void> {
-  const headers: Record<string, string> = {
-    'User-agent': 'gemini-cli',
+  const headers = githubRequestHeaders(url, {
     Accept: 'application/octet-stream',
     ...options?.headers,
-  };
-  const token = getGitHubToken();
-  if (token) {
-    headers['Authorization'] = `token ${token}`;
-  }
+  });
 
   return new Promise((resolve, reject) => {
     https
       .get(url, { headers }, (res) => {
         if (res.statusCode === 302 || res.statusCode === 301) {
+          res.resume();
           if (redirectCount >= 10) {
             return reject(new Error('Too many redirects'));
           }
 
-          if (!res.headers.location) {
+          const location = res.headers.location;
+          if (!location) {
             return reject(
               new Error('Redirect response missing Location header'),
             );
           }
-          downloadFile(res.headers.location, dest, options, redirectCount + 1)
+          Promise.resolve()
+            .then(() =>
+              downloadFile(
+                new URL(location, url).toString(),
+                dest,
+                options,
+                redirectCount + 1,
+              ),
+            )
             .then(resolve)
             .catch(reject);
           return;

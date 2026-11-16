@@ -7,10 +7,94 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import * as https from 'node:https';
 import { EventEmitter } from 'node:events';
-import { fetchJson, getGitHubToken } from './github_fetch.js';
+import {
+  fetchJson,
+  getGitHubToken,
+  githubRequestHeaders,
+} from './github_fetch.js';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 
 vi.mock('node:https');
+
+describe('GitHub credential origin boundary', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetAllMocks();
+  });
+
+  it('authenticates the exact API origin and preserves non-sensitive custom headers', () => {
+    vi.stubEnv('GITHUB_TOKEN', 'fixture-token');
+    expect(
+      githubRequestHeaders('https://api.github.com/repos/fixture', {
+        Accept: 'application/json',
+      }),
+    ).toMatchObject({
+      Authorization: 'token fixture-token',
+      Accept: 'application/json',
+    });
+  });
+
+  it.each([
+    'https://release-assets.githubusercontent.com/asset',
+    'https://api.github.com.audit.invalid/',
+    'https://audit.invalid/',
+    'https://api.github.com:8443/',
+  ])('never sends credentials to %s', (url) => {
+    vi.stubEnv('GITHUB_TOKEN', 'fixture-token');
+    const headers = githubRequestHeaders(url, {
+      authorization: 'fixture-supplied',
+      'Proxy-Authorization': 'fixture-proxy',
+      Accept: 'application/octet-stream',
+    });
+    expect(Object.keys(headers).some((key) => /authorization/i.test(key))).toBe(
+      false,
+    );
+    expect(headers['Accept']).toBe('application/octet-stream');
+  });
+
+  it.each(['http://api.github.com/', 'https://fixture@api.github.com/'])(
+    'rejects unsafe destination %s before any request',
+    async (url) => {
+      await expect(fetchJson(url)).rejects.toThrow('credential-free HTTPS');
+      expect(https.get).not.toHaveBeenCalled();
+    },
+  );
+
+  it('strips credentials when a JSON request redirects away from the API', async () => {
+    vi.stubEnv('GITHUB_TOKEN', 'fixture-token');
+    vi.mocked(https.get)
+      .mockImplementationOnce((_url, options, callback) => {
+        expect(options).toMatchObject({
+          headers: { Authorization: 'token fixture-token' },
+        });
+        const res = new EventEmitter() as IncomingMessage;
+        res.statusCode = 302;
+        res.headers = { location: 'https://audit.invalid/asset' };
+        res.resume = vi.fn();
+        (callback as (res: IncomingMessage) => void)(res);
+        return new EventEmitter() as ClientRequest;
+      })
+      .mockImplementationOnce((_url, options, callback) => {
+        expect(options).toMatchObject({
+          headers: { 'User-Agent': 'gemini-cli' },
+        });
+        expect(
+          (options as { headers: Record<string, string> }).headers[
+            'Authorization'
+          ],
+        ).toBeUndefined();
+        const res = new EventEmitter() as IncomingMessage;
+        res.statusCode = 200;
+        (callback as (res: IncomingMessage) => void)(res);
+        res.emit('data', Buffer.from('{"fixture":true}'));
+        res.emit('end');
+        return new EventEmitter() as ClientRequest;
+      });
+    await expect(fetchJson('https://api.github.com/fixture')).resolves.toEqual({
+      fixture: true,
+    });
+  });
+});
 
 describe('getGitHubToken', () => {
   const originalToken = process.env['GITHUB_TOKEN'];

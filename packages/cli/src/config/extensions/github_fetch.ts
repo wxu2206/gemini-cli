@@ -10,17 +10,42 @@ export function getGitHubToken(): string | undefined {
   return process.env['GITHUB_TOKEN'];
 }
 
+/** Credentials belong to the GitHub API origin, never a release CDN or redirect target. */
+export function githubRequestHeaders(
+  url: string,
+  additionalHeaders: Record<string, string> = {},
+): Record<string, string> {
+  const destination = new URL(url);
+  if (
+    destination.protocol !== 'https:' ||
+    destination.username ||
+    destination.password
+  ) {
+    throw new Error('GitHub downloads require a credential-free HTTPS URL');
+  }
+  const headers: Record<string, string> = {
+    'User-Agent': 'gemini-cli',
+    ...additionalHeaders,
+  };
+  // Header names are case insensitive. Remove any supplied authorization before
+  // deciding whether this exact HTTPS origin may receive a GitHub credential.
+  for (const name of Object.keys(headers)) {
+    if (['authorization', 'proxy-authorization'].includes(name.toLowerCase())) {
+      delete headers[name];
+    }
+  }
+  if (destination.origin === 'https://api.github.com') {
+    const token = getGitHubToken();
+    if (token) headers['Authorization'] = `token ${token}`;
+  }
+  return headers;
+}
+
 export async function fetchJson<T>(
   url: string,
   redirectCount: number = 0,
 ): Promise<T> {
-  const headers: { 'User-Agent': string; Authorization?: string } = {
-    'User-Agent': 'gemini-cli',
-  };
-  const token = getGitHubToken();
-  if (token) {
-    headers.Authorization = `token ${token}`;
-  }
+  const headers = githubRequestHeaders(url);
   return new Promise((resolve, reject) => {
     let settled = false;
     const resolveOnce = (value: T) => {
@@ -56,17 +81,18 @@ export async function fetchJson<T>(
           res.resume();
           return rejectOnce(new Error('Too many redirects'));
         }
-        if (!res.headers.location) {
+        const location = res.headers.location;
+        if (!location) {
           res.resume();
           return rejectOnce(
             new Error('No location header in redirect response'),
           );
         }
         res.resume();
-        fetchJson<T>(
-          new URL(res.headers.location, url).toString(),
-          redirectCount + 1,
-        )
+        Promise.resolve()
+          .then(() =>
+            fetchJson<T>(new URL(location, url).toString(), redirectCount + 1),
+          )
           .then(resolveOnce)
           .catch(rejectOnce);
         return;
